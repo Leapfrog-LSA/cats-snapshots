@@ -1,0 +1,81 @@
+name: Collect RSS snapshot
+
+# Daily collection of the labelled sources' RSS/Atom feeds (docs/calibration.md in
+# the CATS repo). Collector code and data/labels.jsonl come from a read-only
+# checkout of the CATS repo; snapshots are committed here.
+
+on:
+  schedule:
+    - cron: "35 6 * * *" # daily 06:35 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-rss
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: data
+      - uses: actions/checkout@v4
+        with:
+          repository: Leapfrog-LSA/CATS-Contextual-Ambiguity-Trust-Scoring
+          ref: main
+          path: cats
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # collect_rss only needs the HTTP client and logging, not the full stack.
+      - run: pip install httpx structlog
+      - name: Collect snapshot
+        working-directory: cats
+        run: |
+          python -m cats.calibration.collect_rss \
+            --labels data/labels.jsonl \
+            --out "$RUNNER_TEMP/collected.jsonl" \
+            --workers 8 --timeout 20 \
+            --user-agent "Mozilla/5.0 (X11; Linux x86_64) CATS-calibration/1.0"
+      # Re-sync to main and union through merge_snapshots right before each push
+      # attempt, so a same-day snapshot already present is merged, never replaced.
+      - name: Commit snapshot
+        working-directory: data
+        env:
+          PYTHONPATH: ${{ github.workspace }}/cats
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          DAY="$(date -u +%F)"
+          SNAPSHOT="snapshots/labelled_sources_${DAY}.jsonl"
+          COLLECTED="$RUNNER_TEMP/collected.jsonl"
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            mkdir -p snapshots
+            if [ -f "$SNAPSHOT" ]; then
+              echo "Same-day snapshot already on main — merging instead of overwriting."
+              python -m cats.calibration.merge_snapshots --inputs "$SNAPSHOT" "$COLLECTED" --out "$SNAPSHOT"
+            else
+              cp "$COLLECTED" "$SNAPSHOT"
+            fi
+            sha256sum snapshots/*.jsonl > SHA256SUMS
+            git add "$SNAPSHOT" SHA256SUMS
+            if git diff --cached --quiet; then
+              echo "No snapshot changes to commit."
+              exit 0
+            fi
+            git commit -m "data: RSS snapshot ${DAY}"
+            if git push origin HEAD:main; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt (main moved again) — retrying."
+          done
+          echo "Failed to push after 3 attempts." >&2
+          exit 1
